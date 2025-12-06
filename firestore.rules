@@ -1,0 +1,43 @@
+
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Helper functions
+    function isSignedIn() {
+      return request.auth != null;
+    }
+    
+    function isOwner(userId) {
+      return request.auth.uid == userId;
+    }
+    
+    // Check if the user has the 'ADMIN' role in their profile
+    function isAdmin() {
+      return isSignedIn() && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'ADMIN';
+    }
+
+    // 1. Users Collection
+    match /users/{userId} {
+      allow read: if isOwner(userId) || isAdmin(); // Admins can read all users
+      allow create: if isOwner(userId);
+      allow update: if isOwner(userId) || isAdmin(); // Admins can update plans/roles
+      allow delete: if isAdmin(); // Only Admins can delete users
+    }
+
+    // 2. Short IDs Collection
+    match /short_ids/{shortId} {
+      allow get: if isSignedIn();
+      allow list: if false; 
+      allow create: if isSignedIn();
+      allow update: if false;
+      allow delete: if isAdmin(); // Admins can clean up IDs
+    }
+
+    // 3. Lookups Log
+    match /lookups/{lookupId} {
+      allow read: if resource.data.businessId == request.auth.uid || isAdmin();
+      allow create: if request.resource.data.businessId == request.auth.uid;
+    }
+  }
+}
