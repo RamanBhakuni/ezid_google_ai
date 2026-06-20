@@ -1,0 +1,19 @@
+{
+  "name": "ezid-api",
+  "version": "1.0.0",
+  "description": "Local Postgres-backed API for the EZID platform (replaces Firestore data layer)",
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "init-db": "node src/initDb.js",
+    "seed": "node src/seed.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "pg": "^8.11.5",
+    "resend": "^4.0.0"
+  }
+}

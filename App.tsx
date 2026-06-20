@@ -40,6 +40,7 @@ const ProtectedRoute: React.FC<{ children: React.ReactNode, allowedRoles?: UserR
      }
 
      if (!hasAllowedRole) {
+      
          // Redirect to their default dashboard
          return <Navigate to={user.roles?.includes(UserRole.BUSINESS) ? '/dashboard' : '/my-id'} />;
      }
@@ -47,6 +48,7 @@ const ProtectedRoute: React.FC<{ children: React.ReactNode, allowedRoles?: UserR
 
   return <>{children}</>;
 };
+
 
 const AppRoutes = () => {
     return (
