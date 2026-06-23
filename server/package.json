@@ -7,12 +7,16 @@
     "start": "node src/index.js",
     "dev": "node --watch src/index.js",
     "init-db": "node src/initDb.js",
-    "seed": "node src/seed.js"
+    "seed": "node src/seed.js",
+    "migrate-auth": "node src/migrateAuth.js",
+    "set-password": "node src/setPassword.js"
   },
   "dependencies": {
+    "bcryptjs": "^2.4.3",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
+    "jsonwebtoken": "^9.0.2",
     "pg": "^8.11.5",
     "resend": "^4.0.0"
   }

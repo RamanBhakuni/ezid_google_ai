@@ -12,10 +12,21 @@ import { User, UserRole, BulkLookupResult } from "../types";
 const API_BASE: string =
   (import.meta as any).env?.VITE_API_URL || "http://localhost:4000/api";
 
-// Small fetch wrapper: throws Error(message) on non-2xx, returns parsed JSON.
+// --- JWT token storage (Postgres-native auth) ---
+const TOKEN_KEY = "ezid_token";
+export const getToken = (): string | null => localStorage.getItem(TOKEN_KEY);
+export const setToken = (t: string) => localStorage.setItem(TOKEN_KEY, t);
+export const clearToken = () => localStorage.removeItem(TOKEN_KEY);
+
+// Small fetch wrapper: attaches the Bearer token, throws Error(message) on
+// non-2xx, returns parsed JSON.
 async function api<T = any>(path: string, options: RequestInit = {}): Promise<T> {
+  const token = getToken();
   const res = await fetch(`${API_BASE}${path}`, {
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
     ...options,
   });
 
@@ -27,30 +38,72 @@ async function api<T = any>(path: string, options: RequestInit = {}): Promise<T>
 
   if (!res.ok) {
     const message = (body && body.error) || res.statusText || "Request failed";
-    throw new Error(message);
+    const err: any = new Error(message);
+    err.status = res.status;
+    if (body && typeof body === "object" && body.retryAfter != null) {
+      err.retryAfter = body.retryAfter;
+    }
+    throw err;
   }
   return body as T;
 }
 
 const toDate = (v: any): Date | null => (v ? new Date(v) : null);
 
-// --- USER & PROFILE OPERATIONS ---
+const hydrateUser = (data: any): User => ({
+  ...data,
+  planExpiry: toDate(data.planExpiry),
+  quotaRefreshedAt: toDate(data.quotaRefreshedAt),
+  createdAt: toDate(data.createdAt),
+});
 
-export const createUserProfile = async (user: User) => {
-  console.log("DB: createUserProfile called", user);
-  await api("/users", { method: "POST", body: JSON.stringify(user) });
-  console.log("DB: Profile created successfully");
+// --- AUTHENTICATION (Postgres-native) ---
+
+export const authRegister = async (name: string, email: string, password: string, role: UserRole) => {
+  await api("/auth/register", { method: "POST", body: JSON.stringify({ name, email, password, role }) });
 };
+
+export const authLogin = async (email: string, password: string): Promise<User> => {
+  const data = await api<{ token: string; user: any }>("/auth/login", {
+    method: "POST",
+    body: JSON.stringify({ email, password }),
+  });
+  setToken(data.token);
+  return hydrateUser(data.user);
+};
+
+export const authMe = async (): Promise<User | null> => {
+  if (!getToken()) return null;
+  try {
+    const data = await api<any>("/auth/me");
+    return data ? hydrateUser(data) : null;
+  } catch {
+    clearToken();
+    return null;
+  }
+};
+
+export const authVerifyEmail = async (token: string) => {
+  await api("/auth/verify-email", { method: "POST", body: JSON.stringify({ token }) });
+};
+
+export const authResendVerification = async (email: string) => {
+  await api("/auth/resend-verification", { method: "POST", body: JSON.stringify({ email }) });
+};
+
+export const authForgotPassword = async (email: string) => {
+  await api("/auth/forgot-password", { method: "POST", body: JSON.stringify({ email }) });
+};
+
+export const authResetPassword = async (token: string, password: string) => {
+  await api("/auth/reset-password", { method: "POST", body: JSON.stringify({ token, password }) });
+};
+
+// --- USER & PROFILE OPERATIONS ---
 
 export const getUserProfile = async (userId: string): Promise<User | null> => {
   const data = await api<any>(`/users/${encodeURIComponent(userId)}`);
-  if (!data) return null;
-  return {
-    ...data,
-    planExpiry: toDate(data.planExpiry),
-    quotaRefreshedAt: toDate(data.quotaRefreshedAt),
-    createdAt: toDate(data.createdAt),
-  } as User;
+  return data ? hydrateUser(data) : null;
 };
 
 export const addRoleToUser = async (userId: string, newRole: UserRole) => {
@@ -136,14 +189,6 @@ export const updateUserPlan = async (userId: string, planName: string) => {
   });
   console.log(`Updated plan for user ${userId} -> ${data.plan}`);
   return data.plan;
-};
-
-export const syncEmailVerification = async (userId: string) => {
-  try {
-    await api(`/users/${encodeURIComponent(userId)}/verify`, { method: "POST" });
-  } catch (error) {
-    console.error("Error syncing verification status:", error);
-  }
 };
 
 // --- API KEYS ---

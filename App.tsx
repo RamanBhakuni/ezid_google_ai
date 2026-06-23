@@ -3,7 +3,7 @@ import { HashRouter as Router, Routes, Route, Navigate } from 'react-router-dom'
 import { Layout } from './components/Layout';
 import { AuthProvider, useAuth } from './services/authContext';
 import { LandingPage } from './pages/LandingPage';
-import { LoginPage, RegisterPage, ForgotPasswordPage } from './pages/AuthPages';
+import { LoginPage, RegisterPage, ForgotPasswordPage, ResetPasswordPage } from './pages/AuthPages';
 import { UserDashboard } from './pages/UserDashboard';
 import { BusinessDashboard } from './pages/BusinessDashboard';
 import { AdminDashboard } from './pages/AdminDashboard';
@@ -57,6 +57,7 @@ const AppRoutes = () => {
             <Route path="/login" element={<LoginPage />} />
             <Route path="/register" element={<RegisterPage />} />
             <Route path="/forgot-password" element={<ForgotPasswordPage />} />
+            <Route path="/reset-password" element={<ResetPasswordPage />} />
             
             {/* Public Info Pages */}
             <Route path="/how-it-works" element={<HowItWorks />} />

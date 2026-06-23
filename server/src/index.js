@@ -1,8 +1,14 @@
 import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
+import { randomUUID } from 'node:crypto';
 import { pool } from './pool.js';
 import { sendEmail, templates } from './email.js';
+import {
+  hashPassword, comparePassword, signToken, randomToken,
+  requireAuth, requireAdmin, selfOrAdmin,
+} from './auth.js';
+import { rateLimit } from './rateLimit.js';
 
 dotenv.config();
 
@@ -10,12 +16,14 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+const APP_URL = process.env.APP_URL || 'http://localhost:3000';
+
 /* ----------------------------------------------------------------------------
  * Helpers
  * ------------------------------------------------------------------------- */
 
 // Maps a `users` row (snake_case) into the camelCase User shape the frontend
-// expects. Timestamps go out as ISO strings; the client converts to Date.
+// expects. Never leaks password_hash / tokens.
 function rowToUser(r) {
   if (!r) return null;
   return {
@@ -40,8 +48,6 @@ function rowToUser(r) {
   };
 }
 
-// Wraps an async route so thrown errors become a clean JSON response.
-// Use `err.status` to control the HTTP code (defaults to 400).
 const wrap = (fn) => (req, res) => {
   Promise.resolve(fn(req, res)).catch((e) => {
     console.error(`${req.method} ${req.path} failed:`, e.message);
@@ -55,56 +61,182 @@ function fail(message, status = 400) {
   return e;
 }
 
-/* ----------------------------------------------------------------------------
- * Users & profiles
- * ------------------------------------------------------------------------- */
+const isAdmin = (req) =>
+  req.auth?.roles?.includes('ADMIN') || req.auth?.role === 'ADMIN';
 
-// createUserProfile
-app.post('/api/users', wrap(async (req, res) => {
-  const u = req.body;
-  const result = await pool.query(
+const emailKey = (prefix) => (req) => {
+  const email = String(req.body?.email || '').toLowerCase().trim();
+  return email ? `${prefix}:${email}` : null;
+};
+
+// One reset / verification email per address per 90 seconds (server-enforced).
+const resetLimiter = rateLimit({
+  windowMs: 90_000,
+  keyFn: emailKey('reset'),
+  message: 'Please wait before requesting another password reset link.',
+});
+const verifyLimiter = rateLimit({
+  windowMs: 90_000,
+  keyFn: emailKey('verify'),
+  message: 'Please wait before requesting another verification email.',
+});
+
+/* ============================================================================
+ * AUTHENTICATION (Postgres-native, replaces Firebase Auth)
+ * ========================================================================= */
+
+// register
+app.post('/api/auth/register', wrap(async (req, res) => {
+  const { name, email, password, role } = req.body;
+  if (!name || !email || !password) throw fail('Name, email and password are required.');
+  if (String(password).length < 6) throw fail('Password must be at least 6 characters.');
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) throw fail('Please enter a valid email address.');
+  const userRole = role || 'INDIVIDUAL';
+
+  const existing = await pool.query('SELECT id FROM users WHERE lower(email) = lower($1)', [email]);
+  if (existing.rowCount > 0) throw fail('An account with this email already exists. Please log in.', 409);
+
+  const id = randomUUID();
+  const passwordHash = await hashPassword(password);
+  const token = randomToken();
+
+  await pool.query(
     `INSERT INTO users
-       (id, email, name, role, roles, short_id, short_ids, organization_name,
-        plan, quota_used, lookup_balance, quota_refreshed_at, created_at,
-        alias_credits, total_lookups, is_verified)
-     VALUES ($1,$2,$3,$4,$5,$6,'{}',$7,$8,0,10,now(),now(),0,0,$9)
-     ON CONFLICT (id) DO NOTHING`,
-    [
-      u.id, u.email, u.name, u.role, u.roles || [], u.shortId || null,
-      u.organizationName || null, u.plan || 'FREE', u.isVerified ?? false,
-    ]
+       (id, email, name, role, roles, organization_name, plan, quota_used,
+        lookup_balance, quota_refreshed_at, created_at, alias_credits,
+        total_lookups, is_verified, password_hash, verification_token, verification_expires)
+     VALUES ($1,$2,$3,$4,$5,$6,'FREE',0,10,now(),now(),0,0,false,$7,$8, now() + interval '1 day')`,
+    [id, email, name, userRole, [userRole], userRole === 'BUSINESS' ? name : null, passwordHash, token]
   );
 
-  // Fire a welcome email only for genuinely new rows (rowCount 0 = already existed).
-  // Fire-and-forget so a mail hiccup never fails signup.
-  if (result.rowCount > 0 && u.email) {
-    const { subject, html } = templates.welcome(u.name);
-    sendEmail({ to: u.email, subject, html }).catch(() => {});
-  }
+  const link = `${APP_URL}/#/verify-email?token=${token}`;
+  const tpl = templates.verifyEmail(name, link);
+  sendEmail({ to: email, subject: tpl.subject, html: tpl.html }).catch(() => {});
 
   res.json({ ok: true });
 }));
 
-// getUserProfile
-app.get('/api/users/:id', wrap(async (req, res) => {
-  const { rows } = await pool.query('SELECT * FROM users WHERE id = $1', [req.params.id]);
-  res.json(rowToUser(rows[0]) /* null when not found */);
+// login
+app.post('/api/auth/login', wrap(async (req, res) => {
+  const { email, password } = req.body;
+  if (!email || !password) throw fail('Email and password are required.');
+
+  const { rows } = await pool.query('SELECT * FROM users WHERE lower(email) = lower($1)', [email]);
+  const user = rows[0];
+  if (!user || !user.password_hash) throw fail('Invalid email or password.', 401);
+
+  const ok = await comparePassword(password, user.password_hash);
+  if (!ok) throw fail('Invalid email or password.', 401);
+
+  if (!user.is_verified) throw fail('EMAIL_NOT_VERIFIED: Please verify your email before logging in.', 403);
+
+  res.json({ token: signToken(user), user: rowToUser(user) });
 }));
 
-// getAllUsers (admin)
-app.get('/api/users', wrap(async (_req, res) => {
+// current user (from token)
+app.get('/api/auth/me', requireAuth, wrap(async (req, res) => {
+  const { rows } = await pool.query('SELECT * FROM users WHERE id = $1', [req.auth.id]);
+  res.json(rowToUser(rows[0]));
+}));
+
+// verify email (token from the link)
+app.post('/api/auth/verify-email', wrap(async (req, res) => {
+  const { token } = req.body;
+  if (!token) throw fail('Verification token is required.');
   const { rows } = await pool.query(
-    'SELECT * FROM users ORDER BY created_at DESC LIMIT 100'
+    `UPDATE users
+        SET is_verified = true, verification_token = NULL, verification_expires = NULL
+      WHERE verification_token = $1 AND verification_expires > now()
+    RETURNING email, name`,
+    [token]
   );
+  if (rows.length === 0) throw fail('This verification link is invalid or has expired.');
+
+  const tpl = templates.welcome(rows[0].name);
+  sendEmail({ to: rows[0].email, subject: tpl.subject, html: tpl.html }).catch(() => {});
+  res.json({ ok: true });
+}));
+
+// resend verification
+app.post('/api/auth/resend-verification', verifyLimiter, wrap(async (req, res) => {
+  const { email } = req.body;
+  if (!email) throw fail('Email is required.');
+  const { rows } = await pool.query(
+    'SELECT name, is_verified FROM users WHERE lower(email) = lower($1)', [email]
+  );
+  const user = rows[0];
+  if (user && !user.is_verified) {
+    const token = randomToken();
+    await pool.query(
+      `UPDATE users SET verification_token = $2, verification_expires = now() + interval '1 day'
+        WHERE lower(email) = lower($1)`,
+      [email, token]
+    );
+    const link = `${APP_URL}/#/verify-email?token=${token}`;
+    const tpl = templates.verifyEmail(user.name, link);
+    sendEmail({ to: email, subject: tpl.subject, html: tpl.html }).catch(() => {});
+  }
+  res.json({ ok: true }); // never reveal whether the email exists
+}));
+
+// forgot password
+app.post('/api/auth/forgot-password', resetLimiter, wrap(async (req, res) => {
+  const { email } = req.body;
+  if (!email) throw fail('Email is required.');
+  const { rows } = await pool.query('SELECT name FROM users WHERE lower(email) = lower($1)', [email]);
+  if (rows[0]) {
+    const token = randomToken();
+    await pool.query(
+      `UPDATE users SET reset_token = $2, reset_expires = now() + interval '1 hour'
+        WHERE lower(email) = lower($1)`,
+      [email, token]
+    );
+    const link = `${APP_URL}/#/reset-password?token=${token}`;
+    const tpl = templates.resetPassword(rows[0].name, link);
+    sendEmail({ to: email, subject: tpl.subject, html: tpl.html }).catch(() => {});
+  }
+  res.json({ ok: true }); // never reveal whether the email exists
+}));
+
+// reset password
+app.post('/api/auth/reset-password', wrap(async (req, res) => {
+  const { token, password } = req.body;
+  if (!token || !password) throw fail('Token and new password are required.');
+  if (String(password).length < 6) throw fail('Password must be at least 6 characters.');
+  const hash = await hashPassword(password);
+  const { rows } = await pool.query(
+    `UPDATE users
+        SET password_hash = $2, reset_token = NULL, reset_expires = NULL, is_verified = true
+      WHERE reset_token = $1 AND reset_expires > now()
+    RETURNING email`,
+    [token, hash]
+  );
+  if (rows.length === 0) throw fail('This reset link is invalid or has expired.');
+  res.json({ ok: true });
+}));
+
+/* ============================================================================
+ * USERS & PROFILES  (all require a valid token)
+ * ========================================================================= */
+
+// getUserProfile (self or admin)
+app.get('/api/users/:id', requireAuth, selfOrAdmin, wrap(async (req, res) => {
+  const { rows } = await pool.query('SELECT * FROM users WHERE id = $1', [req.params.id]);
+  res.json(rowToUser(rows[0]));
+}));
+
+// getAllUsers (admin only)
+app.get('/api/users', requireAuth, requireAdmin, wrap(async (_req, res) => {
+  const { rows } = await pool.query('SELECT * FROM users ORDER BY created_at DESC LIMIT 100');
   res.json(rows.map(rowToUser));
 }));
 
-// addRoleToUser
-app.post('/api/users/:id/roles', wrap(async (req, res) => {
+// addRoleToUser (self upgrade or admin)
+app.post('/api/users/:id/roles', requireAuth, selfOrAdmin, wrap(async (req, res) => {
   const { role } = req.body;
   await pool.query(
     `UPDATE users
-        SET roles = (SELECT ARRAY(SELECT DISTINCT unnest(array_append(roles, $2))) ),
+        SET roles = (SELECT ARRAY(SELECT DISTINCT unnest(array_append(roles, $2)))),
             role  = $2
       WHERE id = $1`,
     [req.params.id, role]
@@ -112,17 +244,14 @@ app.post('/api/users/:id/roles', wrap(async (req, res) => {
   res.json({ ok: true });
 }));
 
-// addAliasCredit
-app.post('/api/users/:id/alias-credit', wrap(async (req, res) => {
-  await pool.query(
-    'UPDATE users SET alias_credits = alias_credits + 1 WHERE id = $1',
-    [req.params.id]
-  );
+// addAliasCredit (self or admin)
+app.post('/api/users/:id/alias-credit', requireAuth, selfOrAdmin, wrap(async (req, res) => {
+  await pool.query('UPDATE users SET alias_credits = alias_credits + 1 WHERE id = $1', [req.params.id]);
   res.json({ ok: true });
 }));
 
-// updateUserPlan — credit/plan logic ported from the old client code
-app.post('/api/users/:id/plan', wrap(async (req, res) => {
+// updateUserPlan (self or admin)
+app.post('/api/users/:id/plan', requireAuth, selfOrAdmin, wrap(async (req, res) => {
   const { planName } = req.body;
   let dbPlanCode = 'FREE';
   let creditsToAdd = 0;
@@ -133,16 +262,13 @@ app.post('/api/users/:id/plan', wrap(async (req, res) => {
 
   const upd = await pool.query(
     `UPDATE users
-        SET plan = $2,
-            lookup_balance = lookup_balance + $3,
-            plan_expiry = now() + interval '30 days',
-            updated_at = now()
+        SET plan = $2, lookup_balance = lookup_balance + $3,
+            plan_expiry = now() + interval '30 days', updated_at = now()
       WHERE id = $1
     RETURNING email, name, plan_expiry`,
     [req.params.id, dbPlanCode, creditsToAdd]
   );
 
-  // Send a purchase receipt (fire-and-forget).
   const row = upd.rows[0];
   if (row?.email && creditsToAdd > 0) {
     const expiry = row.plan_expiry ? new Date(row.plan_expiry).toDateString() : null;
@@ -153,21 +279,15 @@ app.post('/api/users/:id/plan', wrap(async (req, res) => {
   res.json({ plan: dbPlanCode });
 }));
 
-// syncEmailVerification
-app.post('/api/users/:id/verify', wrap(async (req, res) => {
-  await pool.query('UPDATE users SET is_verified = true WHERE id = $1', [req.params.id]);
-  res.json({ ok: true });
-}));
-
-// generateAndSaveApiKey
-app.post('/api/users/:id/api-key', wrap(async (req, res) => {
+// generateAndSaveApiKey (self or admin)
+app.post('/api/users/:id/api-key', requireAuth, selfOrAdmin, wrap(async (req, res) => {
   const rnd = () => Math.random().toString(36).slice(2, 11);
   const newKey = `ez_live_${rnd()}_${rnd()}`;
   await pool.query('UPDATE users SET api_key = $1 WHERE id = $2', [newKey, req.params.id]);
   res.json({ apiKey: newKey });
 }));
 
-// adminUpdateUser — partial update over a whitelist of columns
+// adminUpdateUser (admin only)
 const COLUMN_MAP = {
   email: 'email', name: 'name', role: 'role', roles: 'roles',
   shortId: 'short_id', shortIds: 'short_ids', organizationName: 'organization_name',
@@ -175,7 +295,7 @@ const COLUMN_MAP = {
   aliasCredits: 'alias_credits', totalLookups: 'total_lookups',
   isVerified: 'is_verified', apiKey: 'api_key',
 };
-app.patch('/api/users/:id', wrap(async (req, res) => {
+app.patch('/api/users/:id', requireAuth, requireAdmin, wrap(async (req, res) => {
   const sets = [];
   const vals = [];
   for (const [key, value] of Object.entries(req.body)) {
@@ -190,19 +310,20 @@ app.patch('/api/users/:id', wrap(async (req, res) => {
   res.json({ ok: true });
 }));
 
-// deleteUser
-app.delete('/api/users/:id', wrap(async (req, res) => {
+// deleteUser (admin only)
+app.delete('/api/users/:id', requireAuth, requireAdmin, wrap(async (req, res) => {
   await pool.query('DELETE FROM users WHERE id = $1', [req.params.id]);
   res.json({ ok: true });
 }));
 
-/* ----------------------------------------------------------------------------
- * Custom short-id claiming (atomic, replaces the Firestore transaction)
- * ------------------------------------------------------------------------- */
+/* ============================================================================
+ * CUSTOM SHORT-ID CLAIMING  (acts on the authenticated user)
+ * ========================================================================= */
 
-app.post('/api/short-ids/claim', wrap(async (req, res) => {
-  const { userId, userEmail, desiredId } = req.body;
-  const cleanId = String(desiredId || '').toLowerCase().trim();
+app.post('/api/short-ids/claim', requireAuth, wrap(async (req, res) => {
+  const userId = req.auth.id;          // derived from token, never trusted from body
+  const userEmail = req.auth.email;
+  const cleanId = String(req.body.desiredId || '').toLowerCase().trim();
 
   if (cleanId.length < 5) throw fail('ID must be at least 5 characters long.');
   if (!/^[a-z0-9._]+$/.test(cleanId)) {
@@ -217,47 +338,26 @@ app.post('/api/short-ids/claim', wrap(async (req, res) => {
     if (taken.rowCount > 0) throw fail(`The ID '${cleanId}' is already taken.`);
 
     const userRes = await client.query('SELECT * FROM users WHERE id = $1 FOR UPDATE', [userId]);
-    const exists = userRes.rowCount > 0;
-    const u = exists ? userRes.rows[0] : { short_ids: [], alias_credits: 0, short_id: null };
-
+    const u = userRes.rows[0];
     const currentIds = u.short_ids || [];
     const credits = u.alias_credits || 0;
     const isFirstFree = currentIds.length === 0 && !u.short_id;
 
     if (!isFirstFree && credits <= 0) throw fail('Payment required for additional aliases.');
 
-    // The user row MUST exist before inserting into short_ids (owner_id FK).
-    // A missing profile means a Firebase-authed user with no Postgres row yet
-    // (e.g. created before the migration) — create it now.
-    if (!exists) {
-      await client.query(
-        `INSERT INTO users
-           (id, email, name, role, roles, short_id, short_ids, plan,
-            quota_used, lookup_balance, alias_credits, total_lookups, created_at)
-         VALUES ($1,$2,'User','INDIVIDUAL', ARRAY['INDIVIDUAL'], $3, ARRAY[$4]::text[],
-                 'FREE', 0, 10, $5, 0, now())`,
-        [userId, userEmail, isFirstFree ? cleanId : null, cleanId, isFirstFree ? 0 : -1]
-      );
-    }
-
     await client.query(
       'INSERT INTO short_ids (short_id, email, owner_id, created_at) VALUES ($1,$2,$3,now())',
       [cleanId, userEmail, userId]
     );
 
-    // For an existing user, append the alias (the new-user INSERT above already
-    // set short_ids / short_id, so no update is needed in that branch).
-    if (exists && isFirstFree) {
+    if (isFirstFree) {
       await client.query(
         'UPDATE users SET short_ids = array_append(short_ids, $2), short_id = $2 WHERE id = $1',
         [userId, cleanId]
       );
-    } else if (exists) {
+    } else {
       await client.query(
-        `UPDATE users
-            SET short_ids = array_append(short_ids, $2),
-                alias_credits = alias_credits - 1
-          WHERE id = $1`,
+        `UPDATE users SET short_ids = array_append(short_ids, $2), alias_credits = alias_credits - 1 WHERE id = $1`,
         [userId, cleanId]
       );
     }
@@ -272,30 +372,27 @@ app.post('/api/short-ids/claim', wrap(async (req, res) => {
   }
 }));
 
-/* ----------------------------------------------------------------------------
- * Core lookup (single) — balance check, lazy reset, expiry, deduct credit
- * ------------------------------------------------------------------------- */
+/* ============================================================================
+ * LOOKUP  (requester = authenticated user)
+ * ========================================================================= */
 
-app.post('/api/lookup', wrap(async (req, res) => {
-  const { requesterId, shortId: shortIdInput } = req.body;
-  const cleanId = String(shortIdInput || '')
+app.post('/api/lookup', requireAuth, wrap(async (req, res) => {
+  const requesterId = req.auth.id;
+  const cleanId = String(req.body.shortId || '')
     .replace(/^(https?:\/\/)?ezid\.in\//, '').replace(/\/$/, '').trim();
 
-  if (!cleanId) return res.json({ shortId: shortIdInput, email: null, status: 'INVALID' });
+  if (!cleanId) return res.json({ shortId: req.body.shortId, email: null, status: 'INVALID' });
 
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
 
     const userRes = await client.query('SELECT * FROM users WHERE id = $1 FOR UPDATE', [requesterId]);
-    if (userRes.rowCount === 0) throw fail('User not found', 404);
     const user = userRes.rows[0];
-
     const currentPlan = user.plan || 'FREE';
     let balance = user.lookup_balance ?? 0;
 
     if (currentPlan === 'FREE') {
-      // Lazy monthly reset for free tier.
       const lastRefresh = user.quota_refreshed_at ? new Date(user.quota_refreshed_at) : null;
       const THIRTY_DAYS = 30 * 24 * 60 * 60 * 1000;
       if (!lastRefresh || Date.now() - lastRefresh.getTime() > THIRTY_DAYS) {
@@ -312,9 +409,7 @@ app.post('/api/lookup', wrap(async (req, res) => {
       }
     }
 
-    if (balance <= 0) {
-      throw fail('QUOTA_EXCEEDED: Insufficient credits. Please upgrade or top-up.');
-    }
+    if (balance <= 0) throw fail('QUOTA_EXCEEDED: Insufficient credits. Please upgrade or top-up.');
 
     const idRes = await client.query('SELECT * FROM short_ids WHERE short_id = $1', [cleanId]);
     let result;
@@ -322,10 +417,7 @@ app.post('/api/lookup', wrap(async (req, res) => {
       const data = idRes.rows[0];
       result = { shortId: cleanId, email: data.email, status: 'FOUND' };
       if (data.owner_id) {
-        await client.query(
-          'UPDATE users SET total_lookups = total_lookups + 1 WHERE id = $1',
-          [data.owner_id]
-        );
+        await client.query('UPDATE users SET total_lookups = total_lookups + 1 WHERE id = $1', [data.owner_id]);
       }
     } else {
       result = { shortId: cleanId, email: null, status: 'NOT_FOUND' };
@@ -336,7 +428,6 @@ app.post('/api/lookup', wrap(async (req, res) => {
        VALUES ($1,$2,$3,$4,now())`,
       [requesterId, cleanId, result.email || null, result.status]
     );
-
     await client.query(
       'UPDATE users SET lookup_balance = lookup_balance - 1, quota_used = quota_used + 1 WHERE id = $1',
       [requesterId]
@@ -352,12 +443,9 @@ app.post('/api/lookup', wrap(async (req, res) => {
   }
 }));
 
-/* ----------------------------------------------------------------------------
- * Bulk lookup — one transaction (replaces writeBatch)
- * ------------------------------------------------------------------------- */
-
-app.post('/api/lookup/bulk', wrap(async (req, res) => {
-  const { requesterId, shortIds } = req.body;
+app.post('/api/lookup/bulk', requireAuth, wrap(async (req, res) => {
+  const requesterId = req.auth.id;
+  const shortIds = req.body.shortIds;
   if (!Array.isArray(shortIds) || shortIds.length === 0) return res.json([]);
 
   const uniqueIds = [...new Set(
@@ -369,8 +457,7 @@ app.post('/api/lookup/bulk', wrap(async (req, res) => {
     await client.query('BEGIN');
 
     const found = await client.query(
-      'SELECT short_id, email FROM short_ids WHERE short_id = ANY($1)',
-      [uniqueIds]
+      'SELECT short_id, email FROM short_ids WHERE short_id = ANY($1)', [uniqueIds]
     );
     const emailById = new Map(found.rows.map((r) => [r.short_id, r.email]));
 
@@ -389,10 +476,7 @@ app.post('/api/lookup/bulk', wrap(async (req, res) => {
     }
 
     await client.query(
-      `UPDATE users
-          SET lookup_balance = lookup_balance - $2,
-              quota_used = quota_used + $2
-        WHERE id = $1`,
+      `UPDATE users SET lookup_balance = lookup_balance - $2, quota_used = quota_used + $2 WHERE id = $1`,
       [requesterId, uniqueIds.length]
     );
 
@@ -406,22 +490,20 @@ app.post('/api/lookup/bulk', wrap(async (req, res) => {
   }
 }));
 
-/* ----------------------------------------------------------------------------
- * Analytics & admin
- * ------------------------------------------------------------------------- */
+/* ============================================================================
+ * ANALYTICS & ADMIN
+ * ========================================================================= */
 
-// getBusinessStats
-app.get('/api/stats/:businessId', wrap(async (req, res) => {
+// getBusinessStats (self or admin)
+app.get('/api/stats/:businessId', requireAuth, wrap(async (req, res) => {
   const { businessId } = req.params;
+  if (businessId !== req.auth.id && !isAdmin(req)) throw fail('Not allowed.', 403);
+
   const lookupsRes = await pool.query(
     `SELECT id, short_id, status, found_email, timestamp, business_id
-       FROM lookups
-      WHERE business_id = $1
-      ORDER BY timestamp DESC
-      LIMIT 2000`,
+       FROM lookups WHERE business_id = $1 ORDER BY timestamp DESC LIMIT 2000`,
     [businessId]
   );
-
   const lookups = lookupsRes.rows.map((r) => ({
     id: String(r.id),
     shortId: r.short_id,
@@ -443,14 +525,13 @@ app.get('/api/stats/:businessId', wrap(async (req, res) => {
   });
 }));
 
-// resetDatabase (admin)
-app.post('/api/admin/reset', wrap(async (_req, res) => {
+// resetDatabase (admin only)
+app.post('/api/admin/reset', requireAuth, requireAdmin, wrap(async (_req, res) => {
   await pool.query('TRUNCATE lookups, short_ids, users RESTART IDENTITY CASCADE');
   res.json({ ok: true });
 }));
 
-// Generic transactional email (e.g. contact form). Awaited so the caller
-// learns whether it actually sent.
+// Generic transactional email (e.g. contact form) — open endpoint.
 app.post('/api/email/send', wrap(async (req, res) => {
   const { to, subject, html } = req.body;
   if (!to || !subject || !html) throw fail('to, subject and html are required.');

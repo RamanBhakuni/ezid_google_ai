@@ -59,6 +59,32 @@ export const templates = {
     ),
   }),
 
+  verifyEmail: (name, link) => ({
+    subject: 'Verify your EZID email',
+    html: shell(
+      `Confirm your email, ${name || 'there'}`,
+      `<p>Thanks for signing up for EZID. Please confirm your email address to activate your account.</p>
+       <p style="margin:24px 0">
+         <a href="${link}" style="background:#4f46e5;color:#fff;padding:12px 22px;border-radius:8px;text-decoration:none;font-weight:bold">Verify Email</a>
+       </p>
+       <p style="color:#64748b;font-size:13px">Or paste this link into your browser:<br><span style="word-break:break-all">${link}</span></p>
+       <p style="color:#94a3b8;font-size:12px">This link expires in 24 hours. If you didn't sign up, ignore this email.</p>`
+    ),
+  }),
+
+  resetPassword: (name, link) => ({
+    subject: 'Reset your EZID password',
+    html: shell(
+      'Password reset request',
+      `<p>Hi ${name || 'there'}, we received a request to reset your EZID password.</p>
+       <p style="margin:24px 0">
+         <a href="${link}" style="background:#4f46e5;color:#fff;padding:12px 22px;border-radius:8px;text-decoration:none;font-weight:bold">Reset Password</a>
+       </p>
+       <p style="color:#64748b;font-size:13px">Or paste this link into your browser:<br><span style="word-break:break-all">${link}</span></p>
+       <p style="color:#94a3b8;font-size:12px">This link expires in 1 hour. If you didn't request this, you can safely ignore it.</p>`
+    ),
+  }),
+
   paymentReceipt: (name, planName, credits, expiry) => ({
     subject: 'Your EZID purchase receipt',
     html: shell(

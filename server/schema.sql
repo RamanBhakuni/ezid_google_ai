@@ -19,8 +19,16 @@ CREATE TABLE IF NOT EXISTS users (
   alias_credits      INTEGER     DEFAULT 0,       -- paid-but-unclaimed aliases
   total_lookups      INTEGER     DEFAULT 0,       -- times this user was looked up
   is_verified        BOOLEAN     DEFAULT false,
-  api_key            TEXT
+  api_key            TEXT,
+  -- Postgres-native auth (replaces Firebase Auth)
+  password_hash        TEXT,
+  verification_token   TEXT,
+  verification_expires TIMESTAMPTZ,
+  reset_token          TEXT,
+  reset_expires        TIMESTAMPTZ
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email_lower ON users (lower(email));
 
 CREATE TABLE IF NOT EXISTS short_ids (
   short_id   TEXT PRIMARY KEY,                    -- the claimed id (globally unique)
